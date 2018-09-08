@@ -1,0 +1,16 @@
+# '%i' becomes 'virbr10' when running `systemctl start dnsmasq@virbr10.service`
+# Remember to run `systemctl daemon-reload` after creating or editing this file.
+
+[Unit]
+Description=Dummy network interface for %i
+After=network-online.target libvirtd.service vmnetzones.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/vmnet/networks/%i/environment
+ExecStart=/usr/local/bin/vmnetctl start %i ${NETWORK} ${ROUTER} ${BROADCAST} ${MACADDR}
+ExecStop=/usr/local/bin/vmnetctl stop %i ${NETWORK} ${ROUTER} ${BROADCAST} ${MACADDR}
+
+[Install]
+WantedBy=multi-user.target

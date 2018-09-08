@@ -1,0 +1,19 @@
+# '%i' becomes 'virbr10' when running `systemctl start dnsmasq@virbr10.service`
+# Remember to run `systemctl daemon-reload` after creating or editing this file.
+
+[Unit]
+Description=DHCP caching server for %i.
+After=network-online.target vmnet@%i.service
+
+[Service]
+Type=forking
+EnvironmentFile=/etc/vmnet/networks/%i/environment
+ExecStartPre=/usr/local/bin/vmnetctl clear-dhcpd %i
+ExecStart=/usr/bin/dhcpd -4 -q -pf /etc/vmnet/networks/%i/dhcpd/pid -cf /etc/vmnet/networks/%i/dhcpd/dhcpd.conf -lf /etc/vmnet/networks/%i/dhcpd/leases %i
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/
+
+[Install]
+WantedBy=multi-user.target

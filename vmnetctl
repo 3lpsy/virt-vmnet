@@ -1,0 +1,376 @@
+#!/bin/bash
+
+set -e
+
+CONF_DIR="/etc/vmnet"
+NETS_DIR="$CONF_DIR/networks"
+IPBIN=$(which ip)
+BRCTLBIN=$(which brctl)
+
+COMMAND="$1"
+BRIDGE="$2"
+
+LOG_DIR="/var/log/vmnet"
+if [[ ${#BRIDGE} -gt 1 ]]; then
+    LOG_FILE="$LOG_DIR/$BRIDGE.log"
+else
+    LOG_FILE="$LOG_DIR/default.log"
+fi
+
+if [[ ! -d "$LOG_DIR" ]]; then
+    mkdir -p "$LOG_DIR"
+fi
+
+function out() {
+    message="$@"
+    echo "$message" | tee --append $LOG_FILE
+}
+
+function print_usage() {
+    echo "Usage: vmnetctl COMMAND [BRIDGE]"
+    echo "    Start All Systemd Services: vmnetctl systemd-start-all"
+    echo "    Stop All Systemd Services: vmnetctl systemd-stop-all"
+    echo "    Enable All Systemd Services: vmnetctl systemd-enable-all"
+    echo "    Disable All Systemd Services: vmnetctl systemd-disable-all"
+    echo "    Start: vmnetctl start BRIDGE"
+    echo "    Stop: vmnetctl stop BRIDGE"
+    echo "    Systemd Start: vmnetctl systemd-start BRIDGE"
+    echo "    Systemd Stop: vmnetctl systemd-stop BRIDGE"
+    echo "    Apply Firewall Rules: vmnetctl apply-firewall BRIDGE"
+    echo "    Remove firewall: vmnetctl remove-firewall BRIDGE"
+    echo "    Clear DHCP History: vmnetctl clear-dhcpd BRIDGE"
+    echo "    Create Zones: vmnetctl systemd-start-zones (calls create-zones)"
+    echo "    Create Zones: vmnetctl systemd-stop-zones (calls delete-zones)"
+    echo "    Create Zones: vmnetctl create-zones"
+    echo "    Delete Zones: vmnetctl delete-zones"
+    echo "    Make Mac Address: vmnetctl make-mac"
+    echo "    Help: vmnetctl help"
+}
+
+if [[ ${#BRIDGE} -gt 1 ]]; then
+    if [[ ! -f "$NETS_DIR/$BRIDGE/environment" ]]; then
+        out "Vmnetctl Log: COMMAND=$COMMAND BRIDGE=$BRIDGE NETWORK=$NETWORK ROUTER=$ROUTER BROADCAST=$BROADCAST MACADDR=$MACADDR"
+        out "Attempting to run a bridge command without an environment! Exiting!"
+        exit 1
+    else
+        source $NETS_DIR/$BRIDGE/environment
+        out "Vmnetctl Log: COMMAND=$COMMAND BRIDGE=$BRIDGE NETWORK=$NETWORK ROUTER=$ROUTER BROADCAST=$BROADCAST MACADDR=$MACADDR"
+        out "Sourcing: $NETS_DIR/$BRIDGE/environment"
+    fi
+else
+    out "Vmnetctl Log: COMMAND=$COMMAND"
+fi
+
+
+if (( $EUID != 0 )); then
+    print_usage
+    echo ""
+    echo "[!] Please run as root"
+    exit 1
+fi
+
+function make_mac() {
+    hexdump -vn3 -e '/3 "52:54:00"' -e '/1 ":%02x"' -e '"\n"' /dev/urandom
+}
+
+function create_dummy_interface() {
+    link="$1"
+    mac="$2"
+    out "Creating dummy interface $link with mac $mac..."
+    $IPBIN link add $link address $mac type dummy | tee --append $LOG_FILE
+}
+
+function toggle_bridge() {
+    bridge="$1"
+    status="$2"
+    if [[ "$status" == "add" ]]; then
+        func="addbr"
+        desc="Creating"
+    elif [[ "$status" == "del" ]]; then
+        func="delbr"
+        desc="Deleting"
+    else
+        out "Incorrect status for toggle_bridge:$status"
+        return 2
+    fi
+    out "$desc new bridge $bridge"
+    $BRCTLBIN $func $bridge | tee --append $LOG_FILE
+    if [[ "$status" == "add" ]]; then
+        $BRCTLBIN show $bridge | tee --append $LOG_FILE
+    fi
+}
+
+function toggle_bridge_stp() {
+    bridge="$1"
+    status="$2"
+    out "Toggling bridge stp $status for $bridge"
+    $BRCTLBIN stp $bridge $status | tee --append $LOG_FILE
+}
+
+function toggle_bridge_interface() {
+    bridge="$1"
+    interface="$2"
+    status="$3"
+    if [[ "$status" == "add" ]]; then
+        func="addif"
+        desc="Adding"
+    elif [[ "$status" == "del" ]]; then
+        func="delif"
+        desc="Deleting"
+    else
+        out "Incorect status for toggle_bridge_interface: $status"
+        return 2
+    fi
+    out "$desc bridge interface $interface to bridge $bridge ..."
+    $BRCTLBIN $func $bridge $interface | tee --append $LOG_FILE
+}
+
+function toggle_interface() {
+    link="$1"
+    status="$2"
+    out "Toggling Interface $link to $status..."
+    $IPBIN link set $link $status | tee --append $LOG_FILE
+    $IPBIN link show $link | tee --append $LOG_FILE
+}
+
+function del_interface() {
+    link="$1"
+    out "Deleting interface $link"
+    $IPBIN link del $link | tee --append $LOG_FILE
+}
+
+function add_address() {
+    ip="$1"
+    link="$2"
+    broadcast="$3"
+    out "Adding address $ip on interface $link with broadcast $broadcast ..."
+    $IPBIN address add $ip dev $link broadcast $broadcast | tee --append $LOG_FILE
+    $IPBIN address show dev $link | tee --append $LOG_FILE
+}
+
+function flush_addresses() {
+    link="$1"
+    out "Flushing addresses on link $link"
+    $IPBIN address flush dev $link | tee --append $LOG_FILE
+}
+
+function create_zone() {
+    bridge="$1"
+    zone="vmnet-$bridge"
+    out "Creating zone $zone"
+    firewall-cmd --new-zone="$zone" --permanent
+}
+
+function create_zones() {
+    out "Creating all zones for networks in $NETS_DIR"
+    for bridge_dir in $NETS_DIR/*; do
+        bridge="$(basename $bridge_dir)";
+        create_zone "$bridge"
+    done
+    out "Warning: Refreshing firewalld"
+    firewall-cmd --reload
+}
+
+function delete_zone() {
+    bridge="$1"
+    zone="vmnet-$bridge"
+    out "Deleting zone $zone"
+    firewall-cmd --delete-zone="$zone" --permanent
+}
+
+function delete_zones() {
+    out "Deleting all zones for networks in $NETS_DIR"
+    for bridge_dir in $NETS_DIR/*; do
+        bridge="$(basename $bridge_dir)";
+        delete_zone "$bridge" || true
+    done
+    out "Warning: Refreshing firewalld"
+    firewall-cmd --reload
+}
+
+function apply_firewall() {
+    bridge="$1"
+    zone="vmnet-$bridge"
+    out "Masquerading zone $zone"
+    firewall-cmd --zone=$zone --add-masquerade
+    out "Applying nat firewall rules to bridge $bridge"
+    out "Adding interface $bridge to zone..."
+    firewall-cmd --zone=$zone --add-interface=$bridge | tee --append $LOG_FILE
+    out "Adding dns and dhcp rules to zone..."
+    firewall-cmd --zone=$zone --add-service=dns | tee --append $LOG_FILE
+    firewall-cmd --zone=$zone --add-service=dhcp | tee --append $LOG_FILE
+}
+
+function remove_firewall() {
+    bridge="$1"
+    network="$2"
+    zone="vmnet-$bridge"
+    out "Removing nat firewall rules to bridge $bridge and network $network" | tee --append $LOG_FILE
+    out "Removing dns and dhcp rules..."
+    firewall-cmd --zone=$zone --remove-service=dns | tee --append $LOG_FILE
+    firewall-cmd --zone=$zone --remove-service=dhcp | tee --append $LOG_FILE
+    out "Removing interface $bridge from zone.."
+    firewall-cmd --zone=$zone --remove-interface=$bridge | tee --append $LOG_FILE
+    out "Firewall has been removed for $bridge but the zone still exists."
+}
+
+function clear_dhcpd() {
+    bridge=$1
+    conf="$NETS_DIR/$bridge"
+    out "Clearing dhcp for $bridge"
+    rm -r $conf/dhcpd/leases || true
+    touch $conf/dhcpd/leases
+}
+
+function start_service() {
+    bridge="$1"
+    service="$2"
+    out "Starting systemd service: $service@$bridge.service"
+    systemctl start $service@$bridge.service
+}
+
+function stop_service() {
+    bridge="$1"
+    service="$2"
+    out "Stopping systemd service: $service@$bridge.service"
+    systemctl stop $service@$bridge.service
+}
+
+function enable_service() {
+    bridge="$1"
+    service="$2"
+    out "Enabling systemd service: $service@$bridge.service"
+    systemctl enable $service@$bridge.service
+}
+
+function disable_service() {
+    bridge="$1"
+    service="$2"
+    out "Disabling systemd service: $service@$bridge.service"
+    systemctl disable $service@$bridge.service
+}
+
+if [[ "$COMMAND" == "help" || "$COMMAND" == '-h' || "$COMMAND" == "--help" ]] ; then
+    print_usage
+    exit 0
+elif [[ "$COMMAND" == "systemd-start-all" ]]; then
+    out "Starting all systemd services for all networks"
+    out "Starting the systemd zone service"
+    systemctl start vmfwzones.service
+    for bridge_dir in $NETS_DIR/*; do
+        bridge="$(basename $bridge_dir)";
+        start_service "$bridge" "vmnet"
+        start_service "$bridge" "vmdhcp"
+        start_service "$bridge" "vmdns"
+        start_service "$bridge" "vmfw"
+    done
+    exit $?
+elif [[ "$COMMAND" == "systemd-stop-all" ]]; then
+    out "Stopping all systemd services for all networks"
+    for bridge_dir in $NETS_DIR/*; do
+        bridge="$(basename $bridge_dir)";
+        stop_service "$bridge" "vmnet"
+        stop_service "$bridge" "vmdhcp"
+        stop_service "$bridge" "vmdns"
+        stop_service "$bridge" "vmfw"
+    done
+    out "Stopping the systemd zone service"
+    systemctl stop vmfwzones.service
+    exit $?
+elif [[ "$COMMAND" == "systemd-enable-all" ]]; then
+    out "Enabling all systemd services for all networks"
+    out "Enabling the systemd zone service"
+    systemctl enable vmfwzones.service
+    for bridge_dir in $NETS_DIR/*; do
+        bridge="$(basename $bridge_dir)";
+        enable_service "$bridge" "vmnet"
+        enable_service "$bridge" "vmdhcp"
+        enable_service "$bridge" "vmdns"
+        enable_service "$bridge" "vmfw"
+    done
+    exit $?
+elif [[ "$COMMAND" == "systemd-disable-all" ]]; then
+    out "Disabling all systemd services for all networks"
+    for bridge_dir in $NETS_DIR/*; do
+        bridge="$(basename $bridge_dir)";
+        disable_service "$bridge" "vmnet"
+        disable_service "$bridge" "vmdhcp"
+        disable_service "$bridge" "vmdns"
+        disable_service "$bridge" "vmfw"
+    done
+    out "Disabling the systemd zone service"
+    systemctl disable vmfwzones.service
+    exit $?
+elif [[ "$COMMAND" == "systemd-stop-zones" ]]; then
+    out "Stopping the systemd zone service"
+    systemctl stop vmfwzones.service
+    exit $?
+elif [[ "$COMMAND" == "systemd-start-zones" ]]; then
+    out "Starting the systemd zone service"
+    systemctl start vmfwzones.service
+    exit $?
+elif [[ "$COMMAND" == "systemd-stop-zones" ]]; then
+    out "Stopping the systemd zone service"
+    systemctl stop vmfwzones.service
+    exit $?
+elif [[ "$COMMAND" == "create-zones" ]]; then
+    out "Attempting to create all network zones"
+    create_zones
+    exit $?
+elif [[ "$COMMAND" == "delete-zones" ]]; then
+    out "Attempting to delete all network zones"
+    delete_zones
+    exit $?
+elif [[ "$COMMAND" == "make-mac" ]]; then
+    make_mac
+    exit $?
+fi
+
+
+if [[ ${#BRIDGE} -lt 2 ]]; then
+    out "Bridge required for command: $COMMAND!"
+    exit 2
+fi
+
+if [[ "$COMMAND" == "start" ]]; then
+    out "Attempting to start vmnet..."
+    create_dummy_interface "${BRIDGE}-dummy" "$MACADDR"
+    toggle_bridge "$BRIDGE" "add"
+    toggle_bridge_stp "$BRIDGE" "on"
+    toggle_bridge_interface "$BRIDGE" "$BRIDGE-dummy" "add"
+    toggle_interface "$BRIDGE" "up"
+    add_address "$ROUTER" "$BRIDGE" "$BROADCAST"
+    toggle_interface "$BRIDGE" "up"
+elif [[ "$COMMAND" == "stop" ]]; then
+    out "Attempting to stop vmnet..."
+    toggle_bridge_interface "$BRIDGE" "$BRIDGE-dummy" "del" || true
+    toggle_bridge "$BRIDGE" "del" || true
+    toggle_interface "$BRIDGE" "down" || true
+    flush_addresses "$BRIDGE" || true
+    flush_addresses "$BRIDGE-dummy" || true
+    del_interface "$BRIDGE" || true
+    del_interface "$BRIDGE-dummy" || true
+elif [[ "$COMMAND" == "systemd-start" ]]; then
+    out "Warning: vmfwzones cannot be started with this command. Ensure it is running."
+    out "Attempting to start systemd units..."
+    start_service "$BRIDGE" "vmnet"
+    start_service "$BRIDGE" "vmdhcp"
+    start_service "$BRIDGE" "vmdns"
+    start_service "$BRIDGE" "vmfw"
+elif [[ "$COMMAND" == "systemd-stop" ]]; then
+    out "Warning: vmfwzones will not be stopped with this command."
+    out "Attempting to stop systemd units..."
+    stop_service "$BRIDGE" "vmnet"
+    stop_service "$BRIDGE" "vmdhcp"
+    stop_service "$BRIDGE" "vmdns"
+    stop_service "$BRIDGE" "vmfw"
+elif [[ "$COMMAND" == "apply-firewall" ]]; then
+    apply_firewall "$BRIDGE" "$NETWORK"
+elif [[ "$COMMAND" == "remove-firewall" ]]; then
+    remove_firewall "$BRIDGE" "$NETWORK"
+elif [[ "$COMMAND" == "clear-dhcpd" || "$COMMAND" == "clear-dhcp" ]]; then
+    clear_dhcpd $BRIDGE || true
+else
+    print_usage;
+    exit 2;
+fi

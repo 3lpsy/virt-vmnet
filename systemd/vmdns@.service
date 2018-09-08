@@ -1,0 +1,16 @@
+# '%i' becomes 'virbr10' when running `systemctl start dnsmasq@virbr10.service`
+# Remember to run `systemctl daemon-reload` after creating or editing this file.
+
+[Unit]
+Description=DHCP and DNS caching server for %i.
+After=network-online.target vmnet@%i.service
+
+[Service]
+EnvironmentFile=/etc/vmnet/networks/%i/environment
+ExecStart=/usr/bin/dnsmasq -k --conf-file=/etc/vmnet/networks/%i/dnsmasq/dnsmasq.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
