@@ -1,0 +1,4 @@
+example/dhcpd/leases
+example/dhcpd/leases~
+example/dhcpd/leases*
+example/dhcpd/pid
